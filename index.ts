@@ -3,6 +3,7 @@ import Hyperbrowser from "@hyperbrowser/sdk";
 import OpenAI from "openai";
 import { zodResponseFormat } from "openai/helpers/zod";
 import { z } from "zod";
+import ora from "ora";
 
 config();
 
@@ -14,6 +15,8 @@ const client = new Hyperbrowser({
   apiKey: HYPERBROWSER_API_KEY,
 });
 
+const spinner = ora();
+
 const Product = z.object({
   name: z.string(),
   price: z.number(),
@@ -23,20 +26,27 @@ const Product = z.object({
 
 const ProductSchema = z.object({ products: z.array(Product) });
 
+const SYSTEM_PROMPT = `You are an expert data extractor. Your task is to extract product information from the provided scraped content.
+Ensure the output adheres to the following structure:
+- Name: Product name
+- Description: A brief description of the product
+- Price: The price in the provided currency (if available)
+- Availability: Whether the product is in stock or out of stock (if available)
+- Additional Details: Any other relevant information (e.g., SKU, category)
+
+Provide the extracted data as a JSON object. Parse the Markdown content carefully to identify and categorize the product details accurately.`;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const scrapeShopifySite = async (url: string) => {
+  spinner.start("Crawling Shopify site...");
+  spinner.start();
   const crawlJob = await client.startCrawlJob({
     url: url,
     maxPages: 1000,
-    followLinks: false,
-    excludePatterns: [],
-    includePatterns: [],
-    useProxy: false,
-    solveCaptchas: false,
   });
 
-  console.log("Crawl job started: ", crawlJob.jobId);
+  console.log("Crawl job started with jobId:", crawlJob.jobId);
 
   let completed = false;
   while (!completed) {
@@ -44,12 +54,14 @@ const scrapeShopifySite = async (url: string) => {
 
     if (job.status === "completed") {
       completed = true;
-      console.log("Crawl job completed: ", crawlJob.jobId);
+      spinner.succeed(`Crawl job completed with jobId: ${crawlJob.jobId}`);
     } else if (job.status === "failed") {
-      console.error("Crawl job failed: ", job.error);
+      spinner.fail(
+        `Crawl job failed with jobId: ${crawlJob.jobId}\nError: ${job.error}`
+      );
       completed = true;
     } else {
-      console.log("Crawl job is still running: ", job.status);
+      spinner.info(`Crawl job is still running: ${job.status}`);
       await sleep(5_000);
     }
   }
@@ -58,41 +70,46 @@ const scrapeShopifySite = async (url: string) => {
 const extractProductData = async (jobId: string) => {
   let scrapedMarkdown = "";
   let pageIndex = 1;
+  spinner.start();
+  let error = false;
   while (true) {
-    const crawlJobResult = await client.getCrawlJob(jobId, {
-      page: pageIndex,
-      batchSize: 10,
-    });
-
-    const pages = crawlJobResult.data;
-    if (pages) {
-      for (const page of pages) {
-        const pageData = page.markdown;
-        if (pageData) {
-          scrapedMarkdown += pageData;
+    spinner.text = `Getting markdown data from page batch ${pageIndex}`;
+    try {
+      const crawlJobResult = await client.getCrawlJob(jobId, {
+        page: pageIndex,
+      });
+      const pages = crawlJobResult.data;
+      if (pages) {
+        for (const page of pages) {
+          const pageData = page.markdown;
+          if (pageData) {
+            scrapedMarkdown += pageData;
+          }
         }
+        if (pageIndex >= crawlJobResult.totalPageBatches) {
+          break;
+        }
+        console.log(crawlJobResult);
+        pageIndex++;
       }
-      if (pageIndex >= crawlJobResult.totalPageBatches) {
-        break;
-      }
-      pageIndex++;
+    } catch (err) {
+      spinner.fail(`Error getting crawl job result: ${err}`);
+      error = true;
+      break;
     }
   }
 
+  if (error) {
+    return;
+  }
+
+  spinner.text = "Extracting product data...";
   const completion = await openai.beta.chat.completions.parse({
     model: "gpt-4o-mini",
     messages: [
       {
         role: "system",
-        content: `You are an expert data extractor. Your task is to extract product information from the provided scraped content. 
-                Ensure the output adheres to the following structure:
-                - Name: Product name
-                - Description: A brief description of the product
-                - Price: The price in the provided currency (if available)
-                - Availability: Whether the product is in stock or out of stock (if available)
-                - Additional Details: Any other relevant information (e.g., SKU, category)
-
-                Provide the extracted data as a JSON object. Parse the Markdown content carefully to identify and categorize the product details accurately.`,
+        content: SYSTEM_PROMPT,
       },
       { role: "user", content: scrapedMarkdown },
     ],
@@ -100,7 +117,8 @@ const extractProductData = async (jobId: string) => {
   });
 
   const productInfo = completion.choices[0].message.parsed;
-  console.log("Products:", productInfo);
+  spinner.succeed("Product data extracted successfully");
+  console.log(JSON.stringify(productInfo?.products, null, 2));
 };
 const args = process.argv.slice(2);
 const command = args[0];
